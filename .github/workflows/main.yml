@@ -1,0 +1,180 @@
+name: Balcão Seguro - Gerar APK Android
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+permissions:
+  contents: read
+env:
+  CI: true
+  EXPO_NO_TELEMETRY: 1
+  NPM_CONFIG_LEGACY_PEER_DEPS: true
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  KEYSTORE_PASSWORD_FALLBACK: BalcaoSeguroCI2026
+jobs:
+  build-apk:
+    name: Compilar APK Release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+      - name: Preparar projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "package.json" ] && [ -d "android" ]; then
+            echo "Projeto encontrado diretamente na raiz."
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ZIP_PATH="$(find . -maxdepth 3 -type f -iname '*.zip' -print -quit || true)"
+          if [ -z "$ZIP_PATH" ]; then
+            echo "ERRO: não encontrei package.json/android na raiz nem um ZIP do projeto."
+            exit 1
+          fi
+          echo "ZIP encontrado: $ZIP_PATH"
+          rm -rf _projeto_extraido
+          mkdir -p _projeto_extraido
+          unzip -q "$ZIP_PATH" -d _projeto_extraido
+          PROJECT_DIR="$(find _projeto_extraido \
+            -type f \
+            -name package.json \
+            -not -path '*/node_modules/*' \
+            -printf '%h\n' \
+            | head -n 1 || true)"
+          if [ -z "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR/android" ]; then
+            echo "ERRO: o ZIP não contém um projeto Expo/React Native Android válido."
+            find _projeto_extraido -maxdepth 5 -type f | sort | head -n 200
+            exit 1
+          fi
+          echo "Projeto extraído em: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: '${{ env.PROJECT_DIR }}/package-lock.json'
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Mostrar ambiente
+        run: |
+          node --version
+          npm --version
+          java -version
+      - name: Instalar dependências
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm ci --legacy-peer-deps --no-audit --fund=false
+      - name: Verificar TypeScript
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm run typecheck
+      - name: Corrigir permissões do Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          chmod +x android/gradlew
+      - name: Preparar assinatura do APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p signing
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && \
+             [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] && \
+             [ -n "${ANDROID_KEY_ALIAS:-}" ] && \
+             [ -n "${ANDROID_KEY_PASSWORD:-}" ]; then
+            echo "Usando keystore configurada nos GitHub Secrets."
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode \
+              > signing/balcao-seguro-upload-key.keystore
+            STORE_PASSWORD="$ANDROID_KEYSTORE_PASSWORD"
+            KEY_ALIAS="$ANDROID_KEY_ALIAS"
+            KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
+          else
+            echo "GitHub Secrets de assinatura não configurados."
+            echo "Será criada uma chave temporária para gerar um APK instalável."
+            STORE_PASSWORD="$KEYSTORE_PASSWORD_FALLBACK"
+            KEY_ALIAS="balcao_seguro_upload"
+            KEY_PASSWORD="$KEYSTORE_PASSWORD_FALLBACK"
+            keytool -genkeypair \
+              -v \
+              -storetype PKCS12 \
+              -keystore signing/balcao-seguro-upload-key.keystore \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$STORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -dname "CN=Balcao Seguro, OU=Android, O=Balcao Seguro, L=Passo Fundo, ST=RS, C=BR"
+          fi
+          cat > android/balcao-seguro-keystore.properties <<EOF
+          storeFile=../signing/balcao-seguro-upload-key.keystore
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          python3 scripts/patch_android_signing.py
+      - name: Compilar APK Release
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          ./gradlew clean assembleRelease --stacktrace --no-daemon
+      - name: Validar APK gerado
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          APK_PATH="$(find android/app/build/outputs/apk/release \
+            -type f \
+            -name '*.apk' \
+            -print \
+            -quit || true)"
+          if [ -z "$APK_PATH" ]; then
+            echo "ERRO: APK não foi gerado."
+            find android/app/build/outputs -type f -print || true
+            exit 1
+          fi
+          echo "APK gerado:"
+          echo "$APK_PATH"
+          ls -lh "$APK_PATH"
+          if [ -f scripts/validar_apk_sem_servidor.py ]; then
+            python3 scripts/validar_apk_sem_servidor.py "$APK_PATH"
+          fi
+      - name: Preparar artefato final
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p apk-final
+          APK_PATH="$(find android/app/build/outputs/apk/release \
+            -type f \
+            -name '*.apk' \
+            -print \
+            -quit)"
+          VERSION="$(node -p "require('./app.json').expo.version")"
+          cp "$APK_PATH" \
+            "apk-final/Balcao-Seguro-v${VERSION}-release.apk"
+          ls -lh apk-final/
+      - name: Disponibilizar APK para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Balcao-Seguro-APK-Release
+          path: '${{ env.PROJECT_DIR }}/apk-final/Balcao-Seguro-*-release.apk'
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enviar logs se o build falhar
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Balcao-Seguro-logs-falha
+          path: |
+            **/*.log
+            **/android/app/build/outputs/**
+          if-no-files-found: ignore
